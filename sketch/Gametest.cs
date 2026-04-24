@@ -31,6 +31,7 @@ public partial class Gametest : GodotP5
 
     private readonly List<NoteState> notes = new();
     private readonly List<int> rawSamples = new();
+    private readonly List<int> recordedSamples = new();
     private SerialPort serialPort;
     private float speed = 2.0f;
     private int score = 0;
@@ -44,17 +45,31 @@ public partial class Gametest : GodotP5
     private const int AnalysisWindowSize = 128;
     private string serialConnectionText = "Serial: disconnected";
     private string analysisText = "Waiting for raw samples";
+    private bool isRecording;
+    private bool isPlayingBack;
+    private int playbackIndex;
+    private float playbackSampleAccumulator;
+    private bool wasLeftMouseDown;
+    private AudioStreamPlayer playbackAudioPlayer;
+    private const int PlaybackMixRateHz = 8000;
 
     public override void Setup()
     {
         CloseSerialPort();
+        EnsureAudioPlayer();
         notes.Clear();
         rawSamples.Clear();
+        recordedSamples.Clear();
         score = 0;
         lastSpawnTimeSeconds = -1.0f;
         lastAnalysisTimeSeconds = -1.0f;
         lastEstimatedFrequency = 0.0f;
         analysisText = "Waiting for raw samples";
+        isRecording = false;
+        isPlayingBack = false;
+        playbackIndex = 0;
+        playbackSampleAccumulator = 0.0f;
+        wasLeftMouseDown = false;
 
         SetTitle("Gametest");
         SetViewportMode(ViewportMode.Always);
@@ -67,7 +82,9 @@ public partial class Gametest : GodotP5
 
     public override void DrawSketch()
     {
+        HandleButtonClicks();
         PollSerial();
+        PumpPlaybackSamples();
         AnalyzeSignalAndSpawnNote();
 
         Background(new Color(30f / 255f, 30f / 255f, 30f / 255f));
@@ -118,12 +135,14 @@ public partial class Gametest : GodotP5
         DrawSketchString(
             ThemeDB.FallbackFont,
             new Vector2(Width * 0.5f, Height - 20),
-            $"{serialConnectionText} | {analysisText}",
+            $"{serialConnectionText} | {analysisText} | rec={isRecording} play={isPlayingBack} samples={recordedSamples.Count}",
             HorizontalAlignment.Center,
             -1,
             12,
             Colors.White
         );
+
+        DrawButtons();
     }
 
     public override void _ExitTree()
@@ -217,6 +236,10 @@ public partial class Gametest : GodotP5
                 if (int.TryParse(line, out int sample))
                 {
                     rawSamples.Add(Mathf.Clamp(sample, 0, 1023));
+                    if (isRecording)
+                    {
+                        recordedSamples.Add(Mathf.Clamp(sample, 0, 1023));
+                    }
                     if (rawSamples.Count > AnalysisWindowSize * 4)
                     {
                         rawSamples.RemoveRange(0, rawSamples.Count - AnalysisWindowSize * 4);
@@ -233,7 +256,204 @@ public partial class Gametest : GodotP5
             string portName = serialPort.PortName;
             CloseSerialPort();
             serialConnectionText = $"Serial: error on {portName} ({ex.Message})";
+        }
     }
+
+    private void PumpPlaybackSamples()
+    {
+        if (!isPlayingBack)
+        {
+            return;
+        }
+
+        if (playbackIndex >= recordedSamples.Count)
+        {
+            isPlayingBack = false;
+            return;
+        }
+
+        playbackSampleAccumulator += DeltaTime * SampleRateHz;
+        int samplesToPush = Mathf.FloorToInt(playbackSampleAccumulator);
+        if (samplesToPush <= 0)
+        {
+            return;
+        }
+
+        playbackSampleAccumulator -= samplesToPush;
+
+        for (int i = 0; i < samplesToPush && playbackIndex < recordedSamples.Count; i++)
+        {
+            rawSamples.Add(recordedSamples[playbackIndex]);
+            playbackIndex += 1;
+        }
+
+        if (rawSamples.Count > AnalysisWindowSize * 4)
+        {
+            rawSamples.RemoveRange(0, rawSamples.Count - AnalysisWindowSize * 4);
+        }
+
+        if (playbackIndex >= recordedSamples.Count)
+        {
+            isPlayingBack = false;
+        }
+    }
+
+    private void ToggleRecording()
+    {
+        if (!isRecording)
+        {
+            recordedSamples.Clear();
+            isPlayingBack = false;
+            playbackIndex = 0;
+            playbackSampleAccumulator = 0.0f;
+            isRecording = true;
+            return;
+        }
+
+        isRecording = false;
+    }
+
+    private void StartPlayback()
+    {
+        if (recordedSamples.Count == 0)
+        {
+            analysisText = "No recording available";
+            return;
+        }
+
+        isRecording = false;
+        isPlayingBack = true;
+        playbackIndex = 0;
+        playbackSampleAccumulator = 0.0f;
+        PlayRecordedAudio();
+    }
+
+    private void EnsureAudioPlayer()
+    {
+        if (playbackAudioPlayer != null)
+        {
+            return;
+        }
+
+        playbackAudioPlayer = new AudioStreamPlayer();
+        AddChild(playbackAudioPlayer);
+    }
+
+    private void PlayRecordedAudio()
+    {
+        EnsureAudioPlayer();
+        if (recordedSamples.Count == 0)
+        {
+            return;
+        }
+
+        int outputSampleCount = Mathf.Max(1, Mathf.RoundToInt(recordedSamples.Count * (float)PlaybackMixRateHz / SampleRateHz));
+        byte[] pcm16 = new byte[outputSampleCount * 2];
+
+        float mean = 0.0f;
+        for (int i = 0; i < recordedSamples.Count; i++)
+        {
+            mean += recordedSamples[i];
+        }
+
+        mean /= recordedSamples.Count;
+
+        for (int i = 0; i < outputSampleCount; i++)
+        {
+            float srcIndex = i * (float)SampleRateHz / PlaybackMixRateHz;
+            int i0 = Mathf.Clamp(Mathf.FloorToInt(srcIndex), 0, recordedSamples.Count - 1);
+            int i1 = Mathf.Clamp(i0 + 1, 0, recordedSamples.Count - 1);
+            float frac = srcIndex - i0;
+
+            float s0 = recordedSamples[i0] - mean;
+            float s1 = recordedSamples[i1] - mean;
+            float interpolated = Mathf.Lerp(s0, s1, frac);
+
+            float normalized = Mathf.Clamp(interpolated / 512.0f, -1.0f, 1.0f);
+            short sample16 = (short)Mathf.RoundToInt(normalized * 32767.0f);
+
+            int byteIndex = i * 2;
+            pcm16[byteIndex] = (byte)(sample16 & 0xFF);
+            pcm16[byteIndex + 1] = (byte)((sample16 >> 8) & 0xFF);
+        }
+
+        AudioStreamWav stream = new AudioStreamWav
+        {
+            Data = pcm16,
+            Format = AudioStreamWav.FormatEnum.Format16Bits,
+            MixRate = PlaybackMixRateHz,
+            Stereo = false,
+        };
+
+        playbackAudioPlayer.Stop();
+        playbackAudioPlayer.Stream = stream;
+        playbackAudioPlayer.Play();
+    }
+
+    private void DrawButtons()
+    {
+        Rect2 recordButtonRect = GetRecordButtonRect();
+        Rect2 playButtonRect = GetPlayButtonRect();
+
+        Color recordColor = isRecording ? new Color(0.85f, 0.2f, 0.2f) : new Color(0.2f, 0.2f, 0.2f);
+        Color playColor = isPlayingBack ? new Color(0.2f, 0.7f, 0.3f) : new Color(0.2f, 0.2f, 0.2f);
+
+        DrawRect(recordButtonRect, recordColor, true);
+        DrawRect(playButtonRect, playColor, true);
+        DrawRect(recordButtonRect, Colors.White, false, 1.0f);
+        DrawRect(playButtonRect, Colors.White, false, 1.0f);
+
+        DrawSketchString(
+            ThemeDB.FallbackFont,
+            new Vector2(recordButtonRect.Position.X + recordButtonRect.Size.X * 0.5f, recordButtonRect.Position.Y + 20),
+            isRecording ? "STOP" : "RECORD",
+            HorizontalAlignment.Center,
+            -1,
+            12,
+            Colors.White
+        );
+
+        DrawSketchString(
+            ThemeDB.FallbackFont,
+            new Vector2(playButtonRect.Position.X + playButtonRect.Size.X * 0.5f, playButtonRect.Position.Y + 20),
+            "PLAY",
+            HorizontalAlignment.Center,
+            -1,
+            12,
+            Colors.White
+        );
+    }
+
+    private void HandleButtonClicks()
+    {
+        bool isLeftMouseDown = Input.IsMouseButtonPressed(Godot.MouseButton.Left);
+        if (isLeftMouseDown && !wasLeftMouseDown)
+        {
+            Vector2 clickPos = new Vector2(MouseX, MouseY);
+            Rect2 recordButtonRect = GetRecordButtonRect();
+            Rect2 playButtonRect = GetPlayButtonRect();
+
+            if (recordButtonRect.HasPoint(clickPos))
+            {
+                ToggleRecording();
+            }
+            else if (playButtonRect.HasPoint(clickPos))
+            {
+                StartPlayback();
+            }
+        }
+
+        wasLeftMouseDown = isLeftMouseDown;
+    }
+
+    private Rect2 GetRecordButtonRect()
+    {
+        return new Rect2(new Vector2(Width - 200, 10), new Vector2(90, 28));
+    }
+
+    private Rect2 GetPlayButtonRect()
+    {
+        return new Rect2(new Vector2(Width - 100, 10), new Vector2(90, 28));
     }
 
     private void AnalyzeSignalAndSpawnNote()
