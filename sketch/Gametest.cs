@@ -1,9 +1,17 @@
 using Godot;
 using System;
 using System.Collections.Generic;
+using System.IO.Ports;
 
 public partial class Gametest : GodotP5
 {
+    private sealed class PitchRange
+    {
+        public char Note { get; set; }
+        public float Low { get; set; }
+        public float High { get; set; }
+    }
+
     private sealed class NoteState
     {
         public float X { get; set; }
@@ -11,15 +19,42 @@ public partial class Gametest : GodotP5
         public bool Hit { get; set; }
     }
 
+    private static readonly PitchRange[] GuitarRanges =
+    {
+        new() { Note = 'e', Low = 62, High = 102 },
+        new() { Note = 'A', Low = 100, High = 120 },
+        new() { Note = 'D', Low = 120, High = 165 },
+        new() { Note = 'G', Low = 165, High = 210 },
+        new() { Note = 'B', Low = 210, High = 290 },
+        new() { Note = 'E', Low = 290, High = 380 },
+    };
+
     private readonly List<NoteState> notes = new();
+    private readonly List<int> rawSamples = new();
+    private SerialPort serialPort;
     private float speed = 2.0f;
     private int score = 0;
     private float noteLaneX = 100.0f;
+    private float lastSpawnTimeSeconds = -1.0f;
+    private float lastAnalysisTimeSeconds = -1.0f;
+    private float lastEstimatedFrequency = 0.0f;
+    private const float SpawnCooldownSeconds = 0.08f;
+    private const float AnalysisIntervalSeconds = 0.05f;
+    private const int SampleRateHz = 1000;
+    private const int AnalysisWindowSize = 128;
+    private string serialConnectionText = "Serial: disconnected";
+    private string analysisText = "Waiting for raw samples";
 
     public override void Setup()
     {
+        CloseSerialPort();
         notes.Clear();
+        rawSamples.Clear();
         score = 0;
+        lastSpawnTimeSeconds = -1.0f;
+        lastAnalysisTimeSeconds = -1.0f;
+        lastEstimatedFrequency = 0.0f;
+        analysisText = "Waiting for raw samples";
 
         SetTitle("Gametest");
         SetViewportMode(ViewportMode.Always);
@@ -27,19 +62,14 @@ public partial class Gametest : GodotP5
         GD.Randomize();
         Background(new Color(30f / 255f, 30f / 255f, 30f / 255f));
 
-        for (int i = 0; i < 20; i++)
-        {
-            notes.Add(new NoteState
-            {
-                X = Width + i * 120,
-                Y = (float)GD.RandRange(100.0, 300.0),
-                Hit = false,
-            });
-        }
+        OpenSerialPort();
     }
 
     public override void DrawSketch()
     {
+        PollSerial();
+        AnalyzeSignalAndSpawnNote();
+
         Background(new Color(30f / 255f, 30f / 255f, 30f / 255f));
 
         Stroke(new Color(0f, 1f, 0f));
@@ -77,12 +107,297 @@ public partial class Gametest : GodotP5
 
         DrawSketchString(
             ThemeDB.FallbackFont,
-            new Vector2(Width * 0.5f, Height - 20),
-            "Move mouse up/down to match pitch",
+            new Vector2(Width * 0.5f, Height - 40),
+            "Arduino sends raw ADC values, PC computes pitch",
             HorizontalAlignment.Center,
             -1,
             14,
             Colors.White
         );
+
+        DrawSketchString(
+            ThemeDB.FallbackFont,
+            new Vector2(Width * 0.5f, Height - 20),
+            $"{serialConnectionText} | {analysisText}",
+            HorizontalAlignment.Center,
+            -1,
+            12,
+            Colors.White
+        );
+    }
+
+    public override void _ExitTree()
+    {
+        CloseSerialPort();
+        base._ExitTree();
+    }
+
+    private void OpenSerialPort()
+    {
+        string[] ports = SerialPort.GetPortNames();
+        if (ports.Length == 0)
+        {
+            serialConnectionText = "Serial: no ports found";
+            return;
+        }
+
+        Array.Sort(ports, ComparePortNames);
+
+        foreach (string portName in ports)
+        {
+            try
+            {
+                SerialPort candidate = new SerialPort(portName, 115200)
+                {
+                    NewLine = "\n",
+                    ReadTimeout = 1,
+                    DtrEnable = true,
+                    RtsEnable = true,
+                };
+
+                candidate.Open();
+                candidate.DiscardInBuffer();
+
+                serialPort = candidate;
+                serialConnectionText = $"Serial: connected ({portName})";
+                return;
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+        }
+
+        serialConnectionText = "Serial: failed to open available ports";
+    }
+
+    private void CloseSerialPort()
+    {
+        if (serialPort == null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (serialPort.IsOpen)
+            {
+                serialPort.Close();
+            }
+        }
+        catch (Exception)
+        {
+            // Intentionally ignored during shutdown/restart.
+        }
+
+        serialPort.Dispose();
+        serialPort = null;
+    }
+
+    private void PollSerial()
+    {
+        if (serialPort == null || !serialPort.IsOpen)
+        {
+            return;
+        }
+
+        try
+        {
+            int linesRead = 0;
+            while (serialPort.BytesToRead > 0 && linesRead < 50)
+            {
+                string line = serialPort.ReadLine().Trim();
+                linesRead += 1;
+
+                if (line.Length == 0)
+                {
+                    continue;
+                }
+
+                if (int.TryParse(line, out int sample))
+                {
+                    rawSamples.Add(Mathf.Clamp(sample, 0, 1023));
+                    if (rawSamples.Count > AnalysisWindowSize * 4)
+                    {
+                        rawSamples.RemoveRange(0, rawSamples.Count - AnalysisWindowSize * 4);
+                    }
+                }
+            }
+        }
+        catch (TimeoutException)
+        {
+            // No full line available yet.
+        }
+        catch (Exception ex)
+        {
+            string portName = serialPort.PortName;
+            CloseSerialPort();
+            serialConnectionText = $"Serial: error on {portName} ({ex.Message})";
+    }
+    }
+
+    private void AnalyzeSignalAndSpawnNote()
+    {
+        if (rawSamples.Count < AnalysisWindowSize)
+        {
+            return;
+        }
+
+        float nowSeconds = Time.GetTicksMsec() / 1000.0f;
+        if (lastAnalysisTimeSeconds >= 0 && nowSeconds - lastAnalysisTimeSeconds < AnalysisIntervalSeconds)
+        {
+            return;
+        }
+
+        float frequency = EstimateFrequencyFromLatestSamples();
+        lastEstimatedFrequency = frequency;
+        lastAnalysisTimeSeconds = nowSeconds;
+
+        if (frequency <= 0)
+        {
+            analysisText = "No stable pitch";
+            return;
+        }
+
+        if (TryMapFrequencyToNote(frequency, out char note, out int barValue))
+        {
+            SpawnNoteFromSerial(note, barValue);
+            analysisText = $"f={frequency:0.0}Hz note={note} bar={barValue}";
+        }
+        else
+        {
+            analysisText = $"f={frequency:0.0}Hz (out of range)";
+        }
+    }
+
+    private float EstimateFrequencyFromLatestSamples()
+    {
+        int offset = rawSamples.Count - AnalysisWindowSize;
+        float mean = 0.0f;
+        for (int i = 0; i < AnalysisWindowSize; i++)
+        {
+            mean += rawSamples[offset + i];
+        }
+
+        mean /= AnalysisWindowSize;
+
+        float[] centered = new float[AnalysisWindowSize];
+        for (int i = 0; i < AnalysisWindowSize; i++)
+        {
+            centered[i] = rawSamples[offset + i] - mean;
+        }
+
+        int minLag = 2;
+        int maxLag = 32;
+        float bestScore = float.MinValue;
+        int bestLag = -1;
+
+        for (int lag = minLag; lag <= maxLag; lag++)
+        {
+            float corr = 0.0f;
+            for (int i = 0; i < AnalysisWindowSize - lag; i++)
+            {
+                corr += centered[i] * centered[i + lag];
+            }
+
+            if (corr > bestScore)
+            {
+                bestScore = corr;
+                bestLag = lag;
+            }
+        }
+
+        if (bestLag <= 0 || bestScore <= 0)
+        {
+            return 0.0f;
+        }
+
+        return (float)SampleRateHz / bestLag;
+    }
+
+    private static bool TryMapFrequencyToNote(float frequency, out char note, out int barValue)
+    {
+        note = '\0';
+        barValue = 64;
+
+        foreach (PitchRange range in GuitarRanges)
+        {
+            if (frequency <= range.Low || frequency >= range.High)
+            {
+                continue;
+            }
+
+            note = range.Note;
+            float t = Mathf.Clamp((frequency - range.Low) / (range.High - range.Low), 0.0f, 1.0f);
+            barValue = Mathf.RoundToInt(Mathf.Lerp(1, 128, t));
+            return true;
+        }
+
+        return false;
+    }
+    private void SpawnNoteFromSerial(char note, int barValue)
+    {
+        float nowSeconds = Time.GetTicksMsec() / 1000.0f;
+        if (lastSpawnTimeSeconds >= 0 && nowSeconds - lastSpawnTimeSeconds < SpawnCooldownSeconds)
+        {
+            return;
+        }
+
+        notes.Add(
+            new NoteState
+            {
+                X = Width + 30,
+                Y = GetYForNote(note, barValue),
+                Hit = false,
+            }
+        );
+
+        lastSpawnTimeSeconds = nowSeconds;
+    }
+
+    private float GetYForNote(char note, int barValue)
+    {
+        return note switch
+        {
+            'e' => 60,
+            'A' => 120,
+            'D' => 180,
+            'G' => 240,
+            'B' => 300,
+            'E' => 360,
+            _ => Mathf.Lerp(Height - 40, 40, Mathf.Clamp(barValue, 0, 128) / 128.0f),
+        };
+    }
+
+    private static int ComparePortNames(string left, string right)
+    {
+        int leftRank = GetPortRank(left);
+        int rightRank = GetPortRank(right);
+        if (leftRank != rightRank)
+        {
+            return leftRank.CompareTo(rightRank);
+        }
+
+        return string.Compare(left, right, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int GetPortRank(string name)
+    {
+        if (name.Contains("ttyACM", StringComparison.OrdinalIgnoreCase))
+        {
+            return 0;
+        }
+
+        if (name.Contains("ttyUSB", StringComparison.OrdinalIgnoreCase))
+        {
+            return 1;
+        }
+
+        if (name.Contains("COM", StringComparison.OrdinalIgnoreCase))
+        {
+            return 2;
+        }
+
+        return 3;
     }
 }
