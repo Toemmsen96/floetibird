@@ -52,6 +52,18 @@ public partial class Gametest : GodotP5
     private bool wasLeftMouseDown;
     private AudioStreamPlayer playbackAudioPlayer;
     private const int PlaybackMixRateHz = 8000;
+    private float playerY = 200;
+    private char lastDetectedNote = 'e';
+    private int lastBarValue = 64;
+
+    private const int SpectrumSize = 64;
+    private float lastFilteredSample = 0f;
+
+    private readonly float[] spectrum = new float[SpectrumSize];
+    private float lowPass = 0f;
+
+    private float lastRandomSpawnTime = 0f;
+private const float RandomSpawnInterval = 1.0f; // adjust difficulty
 
     public override void Setup()
     {
@@ -73,7 +85,7 @@ public partial class Gametest : GodotP5
 
         SetTitle("Gametest");
         SetViewportMode(ViewportMode.Always);
-        CreateCanvas(600, 400);
+        CreateCanvas(800, 400);
         GD.Randomize();
         Background(new Color(30f / 255f, 30f / 255f, 30f / 255f));
 
@@ -84,8 +96,16 @@ public partial class Gametest : GodotP5
     {
         HandleButtonClicks();
         PollSerial();
+        ComputeSpectrum();
         PumpPlaybackSamples();
         AnalyzeSignalAndSpawnNote();
+        float now = Time.GetTicksMsec() / 1000.0f;
+
+        if (now - lastRandomSpawnTime > RandomSpawnInterval)
+        {
+            SpawnRandomNote();
+            lastRandomSpawnTime = now;
+        }
 
         Background(new Color(30f / 255f, 30f / 255f, 30f / 255f));
 
@@ -94,7 +114,8 @@ public partial class Gametest : GodotP5
 
         NoStroke();
         Fill(new Color(0f, 1f, 0f));
-        Circle(noteLaneX, MouseY, 10);
+        playerY = GetYForNote(lastDetectedNote, lastBarValue);
+        Circle(noteLaneX, playerY, 12);
 
         foreach (NoteState note in notes)
         {
@@ -103,7 +124,11 @@ public partial class Gametest : GodotP5
             Fill(new Color(1f, 200f / 255f, 0f));
             Circle(note.X, note.Y, 10);
 
-            if (!note.Hit && Mathf.Abs(note.X - noteLaneX) < 10 && Mathf.Abs(note.Y - MouseY) < 20)
+            float playerY = GetYForNote(lastDetectedNote, lastBarValue);
+
+            if (!note.Hit &&
+                Mathf.Abs(note.X - noteLaneX) < 10 &&
+                Mathf.Abs(note.Y - playerY) < 20)
             {
                 note.Hit = true;
                 score += 10;
@@ -143,6 +168,7 @@ public partial class Gametest : GodotP5
         );
 
         DrawButtons();
+        DrawSpectrum();
     }
 
     public override void _ExitTree()
@@ -235,7 +261,15 @@ public partial class Gametest : GodotP5
 
                 if (int.TryParse(line, out int sample))
                 {
-                    rawSamples.Add(Mathf.Clamp(sample, 0, 1023));
+                    lowPass = Mathf.Lerp(lowPass, sample, 0.15f);
+                    float alpha = 0.15f;
+
+                    float filtered = Mathf.Lerp(lastFilteredSample, sample, alpha);
+                    lastFilteredSample = filtered;
+
+                    float centered = filtered - 512.0f;
+
+                    rawSamples.Add(Mathf.Clamp((int)centered, -512, 512));
                     if (isRecording)
                     {
                         recordedSamples.Add(Mathf.Clamp(sample, 0, 1023));
@@ -365,12 +399,12 @@ public partial class Gametest : GodotP5
             int i1 = Mathf.Clamp(i0 + 1, 0, recordedSamples.Count - 1);
             float frac = srcIndex - i0;
 
-            float s0 = recordedSamples[i0] - mean;
-            float s1 = recordedSamples[i1] - mean;
+            float s0 = Mathf.Clamp((recordedSamples[i0]) / 512.0f, -1f, 1f);
+            float s1 = Mathf.Clamp((recordedSamples[i1]) / 512.0f, -1f, 1f);
             float interpolated = Mathf.Lerp(s0, s1, frac);
 
-            float normalized = Mathf.Clamp(interpolated / 512.0f, -1.0f, 1.0f);
-            short sample16 = (short)Mathf.RoundToInt(normalized * 32767.0f);
+            float normalized = Mathf.Clamp(interpolated, -1f, 1f);
+            short sample16 = (short)(normalized * 30000f);
 
             int byteIndex = i * 2;
             pcm16[byteIndex] = (byte)(sample16 & 0xFF);
@@ -481,7 +515,9 @@ public partial class Gametest : GodotP5
 
         if (TryMapFrequencyToNote(frequency, out char note, out int barValue))
         {
-            SpawnNoteFromSerial(note, barValue);
+            lastDetectedNote = note;
+            lastBarValue = barValue;
+            analysisText = $"f={frequency:0.0}Hz note={note} bar={barValue}";
             analysisText = $"f={frequency:0.0}Hz note={note} bar={barValue}";
         }
         else
@@ -620,4 +656,89 @@ public partial class Gametest : GodotP5
 
         return 3;
     }
+
+    private void SpawnRandomNote()
+{
+    char[] possibleNotes = { 'e', 'A', 'D', 'G', 'B', 'E' };
+    char note = possibleNotes[GD.RandRange(0, possibleNotes.Length - 1)];
+
+    notes.Add(new NoteState
+    {
+        X = Width + 30,
+        Y = GetYForNote(note, 64),
+        Hit = false,
+    });
+}
+
+private void ComputeSpectrum()
+{
+    if (rawSamples.Count < AnalysisWindowSize)
+        return;
+
+    int offset = rawSamples.Count - AnalysisWindowSize;
+
+    float mean = 0;
+    for (int i = 0; i < AnalysisWindowSize; i++)
+        mean += rawSamples[offset + i];
+    mean /= AnalysisWindowSize;
+
+    float[] centered = new float[AnalysisWindowSize];
+    for (int i = 0; i < AnalysisWindowSize; i++)
+        centered[i] = rawSamples[offset + i] - mean;
+
+    // reset spectrum
+    for (int i = 0; i < SpectrumSize; i++)
+        spectrum[i] = 0;
+
+    int minLag = 2;
+    int maxLag = 40;
+
+    for (int lag = minLag; lag < maxLag; lag++)
+    {
+        float corr = 0;
+
+        for (int i = 0; i < AnalysisWindowSize - lag; i++)
+        {
+            corr += centered[i] * centered[i + lag];
+        }
+
+        int index = Mathf.Clamp((int)((float)lag / maxLag * SpectrumSize), 0, SpectrumSize - 1);
+
+        spectrum[index] += Mathf.Max(0, corr);
+    }
+
+    // normalize
+    float max = 0;
+    for (int i = 0; i < SpectrumSize; i++)
+        max = Mathf.Max(max, spectrum[i]);
+
+    if (max > 0)
+    {
+        for (int i = 0; i < SpectrumSize; i++)
+            spectrum[i] /= max;
+    }
+}
+private void DrawSpectrum()
+{
+    float baseY = Height - 50;
+    float width = Width;
+    float step = width / SpectrumSize;
+
+    Stroke(new Color(0.3f, 1f, 0.6f));
+
+    Vector2 prev = Vector2.Zero;
+
+    for (int i = 0; i < SpectrumSize; i++)
+    {
+        float x = i * step;
+        float y = baseY - spectrum[i] * 120; // height scale
+
+        if (i > 0)
+        {
+            Line(prev.X, prev.Y, x, y);
+        }
+
+        prev = new Vector2(x, y);
+    }
+}
 }
