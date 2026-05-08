@@ -1,7 +1,5 @@
 using Godot;
-using System;
 using System.Collections.Generic;
-using System.IO.Ports;
 
 public partial class Gametest : GodotP5
 {
@@ -19,20 +17,28 @@ public partial class Gametest : GodotP5
         public bool Hit { get; set; }
     }
 
-    private static readonly PitchRange[] GuitarRanges =
+    // Melodica F3–F6: ~175 Hz – ~1397 Hz, split into three playable registers
+    private static readonly PitchRange[] MelodicaRanges =
     {
-        new() { Note = 'e', Low = 62, High = 102 },
-        new() { Note = 'A', Low = 100, High = 120 },
-        new() { Note = 'D', Low = 120, High = 165 },
-        new() { Note = 'G', Low = 165, High = 210 },
-        new() { Note = 'B', Low = 210, High = 290 },
-        new() { Note = 'E', Low = 290, High = 380 },
+        new() { Note = 'L', Low = 175,  High = 370  },  // low register  F3–F#4
+        new() { Note = 'M', Low = 370,  High = 740  },  // mid register  G4–F#5
+        new() { Note = 'H', Low = 740,  High = 1397 },  // high register G5–F6
     };
+
+    // Full melodica range used for the silence gate
+    private const float MelodicaMinHz = 175f;
+    private const float MelodicaMaxHz = 1397f;
 
     private readonly List<NoteState> notes = new();
     private readonly List<int> rawSamples = new();
     private readonly List<int> recordedSamples = new();
-    private SerialPort serialPort;
+
+    private AudioStreamPlayer micPlayer;
+    private AudioEffectCapture captureEffect;
+    private int captureBusIndex = -1;
+
+    private const int SampleRateHz = 44100;
+
     private float speed = 2.0f;
     private int score = 0;
     private float noteLaneX = 100.0f;
@@ -41,33 +47,29 @@ public partial class Gametest : GodotP5
     private float lastEstimatedFrequency = 0.0f;
     private const float SpawnCooldownSeconds = 0.08f;
     private const float AnalysisIntervalSeconds = 0.05f;
-    private const int SampleRateHz = 1000;
-    private const int AnalysisWindowSize = 128;
-    private string serialConnectionText = "Serial: disconnected";
-    private string analysisText = "Waiting for raw samples";
+    private const int AnalysisWindowSize = 4096;
+    private string micStatusText = "Mic: initializing";
+    private string analysisText = "Waiting for samples";
     private bool isRecording;
     private bool isPlayingBack;
     private int playbackIndex;
     private float playbackSampleAccumulator;
     private bool wasLeftMouseDown;
     private AudioStreamPlayer playbackAudioPlayer;
-    private const int PlaybackMixRateHz = 8000;
+    private const int PlaybackMixRateHz = 44100;
     private float playerY = 200;
-    private char lastDetectedNote = 'e';
+    private char lastDetectedNote = 'M';
     private int lastBarValue = 64;
 
     private const int SpectrumSize = 64;
-    private float lastFilteredSample = 0f;
-
     private readonly float[] spectrum = new float[SpectrumSize];
-    private float lowPass = 0f;
 
     private float lastRandomSpawnTime = 0f;
-private const float RandomSpawnInterval = 1.0f; // adjust difficulty
+    private const float RandomSpawnInterval = 1.0f;
 
     public override void Setup()
     {
-        CloseSerialPort();
+        StopMicCapture();
         EnsureAudioPlayer();
         notes.Clear();
         rawSamples.Clear();
@@ -76,7 +78,7 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         lastSpawnTimeSeconds = -1.0f;
         lastAnalysisTimeSeconds = -1.0f;
         lastEstimatedFrequency = 0.0f;
-        analysisText = "Waiting for raw samples";
+        analysisText = "Waiting for samples";
         isRecording = false;
         isPlayingBack = false;
         playbackIndex = 0;
@@ -89,13 +91,13 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         GD.Randomize();
         Background(new Color(30f / 255f, 30f / 255f, 30f / 255f));
 
-        OpenSerialPort();
+        StartMicCapture();
     }
 
     public override void DrawSketch()
     {
         HandleButtonClicks();
-        PollSerial();
+        PollMicrophone();
         ComputeSpectrum();
         PumpPlaybackSamples();
         AnalyzeSignalAndSpawnNote();
@@ -116,6 +118,7 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         Fill(new Color(0f, 1f, 0f));
         playerY = GetYForNote(lastDetectedNote, lastBarValue);
         Circle(noteLaneX, playerY, 12);
+
         foreach (NoteState note in notes)
         {
             note.X -= speed;
@@ -123,11 +126,11 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
             Fill(new Color(1f, 200f / 255f, 0f));
             Circle(note.X, note.Y, 10);
 
-            float playerY = GetYForNote(lastDetectedNote, lastBarValue);
+            float pY = GetYForNote(lastDetectedNote, lastBarValue);
 
             if (!note.Hit &&
                 Mathf.Abs(note.X - noteLaneX) < 10 &&
-                Mathf.Abs(note.Y - playerY) < 20)
+                Mathf.Abs(note.Y - pY) < 20)
             {
                 note.Hit = true;
                 score += 10;
@@ -149,7 +152,7 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         DrawSketchString(
             ThemeDB.FallbackFont,
             new Vector2(Width * 0.5f, Height - 40),
-            "Arduino sends raw ADC values, PC computes pitch",
+            "Listening via computer microphone",
             HorizontalAlignment.Center,
             -1,
             14,
@@ -159,7 +162,7 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         DrawSketchString(
             ThemeDB.FallbackFont,
             new Vector2(Width * 0.5f, Height - 20),
-            $"{serialConnectionText} | {analysisText} | rec={isRecording} play={isPlayingBack} samples={recordedSamples.Count}",
+            $"{micStatusText} | {analysisText} | rec={isRecording} play={isPlayingBack} samples={recordedSamples.Count}",
             HorizontalAlignment.Center,
             -1,
             12,
@@ -172,132 +175,87 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
 
     public override void _ExitTree()
     {
-        CloseSerialPort();
+        StopMicCapture();
         base._ExitTree();
     }
 
-    private void OpenSerialPort()
+    // ── Microphone capture ────────────────────────────────────────────────────
+
+    private void StartMicCapture()
     {
-        string[] ports = SerialPort.GetPortNames();
-        if (ports.Length == 0)
+        // Create a dedicated bus so we don't pollute Master
+        captureBusIndex = AudioServer.BusCount;
+        AudioServer.AddBus(captureBusIndex);
+        AudioServer.SetBusName(captureBusIndex, "MicCapture");
+        AudioServer.SetBusMute(captureBusIndex, true); // don't play mic back through speakers
+
+        captureEffect = new AudioEffectCapture();
+        AudioServer.AddBusEffect(captureBusIndex, captureEffect);
+
+        micPlayer = new AudioStreamPlayer
         {
-            serialConnectionText = "Serial: no ports found";
-            return;
-        }
+            Stream = new AudioStreamMicrophone(),
+            Bus = "MicCapture",
+        };
+        AddChild(micPlayer);
+        micPlayer.Play();
 
-        Array.Sort(ports, ComparePortNames);
-
-        foreach (string portName in ports)
-        {
-            try
-            {
-                SerialPort candidate = new SerialPort(portName, 115200)
-                {
-                    NewLine = "\n",
-                    ReadTimeout = 1,
-                    DtrEnable = true,
-                    RtsEnable = true,
-                };
-
-                candidate.Open();
-                candidate.DiscardInBuffer();
-
-                serialPort = candidate;
-                serialConnectionText = $"Serial: connected ({portName})";
-                return;
-            }
-            catch (Exception)
-            {
-                continue;
-            }
-        }
-
-        serialConnectionText = "Serial: failed to open available ports";
+        micStatusText = "Mic: active";
     }
 
-    private void CloseSerialPort()
+    private void StopMicCapture()
     {
-        if (serialPort == null)
+        if (micPlayer != null)
         {
-            return;
+            micPlayer.Stop();
+            if (IsInstanceValid(micPlayer))
+                micPlayer.QueueFree();
+            micPlayer = null;
         }
 
-        try
+        if (captureEffect != null)
         {
-            if (serialPort.IsOpen)
-            {
-                serialPort.Close();
-            }
-        }
-        catch (Exception)
-        {
-            // Intentionally ignored during shutdown/restart.
+            captureEffect = null;
         }
 
-        serialPort.Dispose();
-        serialPort = null;
+        if (captureBusIndex >= 0 && captureBusIndex < AudioServer.BusCount)
+        {
+            AudioServer.RemoveBus(captureBusIndex);
+            captureBusIndex = -1;
+        }
     }
 
-    private void PollSerial()
+    private void PollMicrophone()
     {
-        if (serialPort == null || !serialPort.IsOpen)
-        {
+        if (captureEffect == null)
             return;
-        }
 
-        try
+        int available = captureEffect.GetFramesAvailable();
+        if (available <= 0)
+            return;
+
+        Vector2[] frames = captureEffect.GetBuffer(available);
+
+        foreach (Vector2 frame in frames)
         {
-            int linesRead = 0;
-            while (serialPort.BytesToRead > 0 && linesRead < 50)
-            {
-                string line = serialPort.ReadLine().Trim();
-                linesRead += 1;
+            float mono = (frame.X + frame.Y) * 0.5f;
+            int sample = Mathf.Clamp(Mathf.RoundToInt(mono * 32767f), -32767, 32767);
 
-                if (line.Length == 0)
-                {
-                    continue;
-                }
-
-                if (int.TryParse(line, out int sample))
-                {
-                    lowPass = Mathf.Lerp(lowPass, sample, 0.15f);
-                    float alpha = 0.15f;
-
-                    float filtered = Mathf.Lerp(lastFilteredSample, sample, alpha);
-                    lastFilteredSample = filtered;
-
-                    float centered = filtered - 512.0f;
-
-                    rawSamples.Add(Mathf.Clamp((int)centered, -512, 512));
-                    if (isRecording)
-                    {
-                        recordedSamples.Add(Mathf.Clamp(sample, 0, 1023));
-                    }
-                    if (rawSamples.Count > AnalysisWindowSize * 4)
-                    {
-                        rawSamples.RemoveRange(0, rawSamples.Count - AnalysisWindowSize * 4);
-                    }
-                }
-            }
+            rawSamples.Add(sample);
+            if (isRecording)
+                recordedSamples.Add(Mathf.Clamp(Mathf.RoundToInt(mono * 32767f) + 32767, 0, 65534));
         }
-        catch (TimeoutException)
-        {
-            // No full line available yet.
-        }
-        catch (Exception ex)
-        {
-            string portName = serialPort.PortName;
-            CloseSerialPort();
-            serialConnectionText = $"Serial: error on {portName} ({ex.Message})";
-        }
+
+        if (rawSamples.Count > AnalysisWindowSize * 4)
+            rawSamples.RemoveRange(0, rawSamples.Count - AnalysisWindowSize * 4);
     }
+
+    // ── Playback ──────────────────────────────────────────────────────────────
 
     private void PumpPlaybackSamples()
     {
         if (!isPlayingBack)
-        {
             return;
-        }
 
         if (playbackIndex >= recordedSamples.Count)
         {
@@ -308,9 +266,7 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         playbackSampleAccumulator += DeltaTime * SampleRateHz;
         int samplesToPush = Mathf.FloorToInt(playbackSampleAccumulator);
         if (samplesToPush <= 0)
-        {
             return;
-        }
 
         playbackSampleAccumulator -= samplesToPush;
 
@@ -321,14 +277,10 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         }
 
         if (rawSamples.Count > AnalysisWindowSize * 4)
-        {
             rawSamples.RemoveRange(0, rawSamples.Count - AnalysisWindowSize * 4);
-        }
 
         if (playbackIndex >= recordedSamples.Count)
-        {
             isPlayingBack = false;
-        }
     }
 
     private void ToggleRecording()
@@ -364,9 +316,7 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
     private void EnsureAudioPlayer()
     {
         if (playbackAudioPlayer != null)
-        {
             return;
-        }
 
         playbackAudioPlayer = new AudioStreamPlayer();
         AddChild(playbackAudioPlayer);
@@ -376,20 +326,10 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
     {
         EnsureAudioPlayer();
         if (recordedSamples.Count == 0)
-        {
             return;
-        }
 
         int outputSampleCount = Mathf.Max(1, Mathf.RoundToInt(recordedSamples.Count * (float)PlaybackMixRateHz / SampleRateHz));
         byte[] pcm16 = new byte[outputSampleCount * 2];
-
-        float mean = 0.0f;
-        for (int i = 0; i < recordedSamples.Count; i++)
-        {
-            mean += recordedSamples[i];
-        }
-
-        mean /= recordedSamples.Count;
 
         for (int i = 0; i < outputSampleCount; i++)
         {
@@ -398,13 +338,11 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
             int i1 = Mathf.Clamp(i0 + 1, 0, recordedSamples.Count - 1);
             float frac = srcIndex - i0;
 
-            float s0 = Mathf.Clamp((recordedSamples[i0]) / 512.0f, -1f, 1f);
-            float s1 = Mathf.Clamp((recordedSamples[i1]) / 512.0f, -1f, 1f);
+            float s0 = Mathf.Clamp((recordedSamples[i0] - 32767) / 32767.0f, -1f, 1f);
+            float s1 = Mathf.Clamp((recordedSamples[i1] - 32767) / 32767.0f, -1f, 1f);
             float interpolated = Mathf.Lerp(s0, s1, frac);
 
-            float normalized = Mathf.Clamp(interpolated, -1f, 1f);
-            short sample16 = (short)(normalized * 30000f);
-
+            short sample16 = (short)(Mathf.Clamp(interpolated, -1f, 1f) * 30000f);
             int byteIndex = i * 2;
             pcm16[byteIndex] = (byte)(sample16 & 0xFF);
             pcm16[byteIndex + 1] = (byte)((sample16 >> 8) & 0xFF);
@@ -422,6 +360,8 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         playbackAudioPlayer.Stream = stream;
         playbackAudioPlayer.Play();
     }
+
+    // ── UI ────────────────────────────────────────────────────────────────────
 
     private void DrawButtons()
     {
@@ -463,44 +403,28 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         if (isLeftMouseDown && !wasLeftMouseDown)
         {
             Vector2 clickPos = new Vector2(MouseX, MouseY);
-            Rect2 recordButtonRect = GetRecordButtonRect();
-            Rect2 playButtonRect = GetPlayButtonRect();
-
-            if (recordButtonRect.HasPoint(clickPos))
-            {
+            if (GetRecordButtonRect().HasPoint(clickPos))
                 ToggleRecording();
-            }
-            else if (playButtonRect.HasPoint(clickPos))
-            {
+            else if (GetPlayButtonRect().HasPoint(clickPos))
                 StartPlayback();
-            }
         }
 
         wasLeftMouseDown = isLeftMouseDown;
     }
 
-    private Rect2 GetRecordButtonRect()
-    {
-        return new Rect2(new Vector2(Width - 200, 10), new Vector2(90, 28));
-    }
+    private Rect2 GetRecordButtonRect() => new(new Vector2(Width - 200, 10), new Vector2(90, 28));
+    private Rect2 GetPlayButtonRect() => new(new Vector2(Width - 100, 10), new Vector2(90, 28));
 
-    private Rect2 GetPlayButtonRect()
-    {
-        return new Rect2(new Vector2(Width - 100, 10), new Vector2(90, 28));
-    }
+    // ── Signal analysis ───────────────────────────────────────────────────────
 
     private void AnalyzeSignalAndSpawnNote()
     {
         if (rawSamples.Count < AnalysisWindowSize)
-        {
             return;
-        }
 
         float nowSeconds = Time.GetTicksMsec() / 1000.0f;
         if (lastAnalysisTimeSeconds >= 0 && nowSeconds - lastAnalysisTimeSeconds < AnalysisIntervalSeconds)
-        {
             return;
-        }
 
         float frequency = EstimateFrequencyFromLatestSamples();
         lastEstimatedFrequency = frequency;
@@ -517,7 +441,6 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
             lastDetectedNote = note;
             lastBarValue = barValue;
             analysisText = $"f={frequency:0.0}Hz note={note} bar={barValue}";
-            analysisText = $"f={frequency:0.0}Hz note={note} bar={barValue}";
         }
         else
         {
@@ -530,20 +453,16 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         int offset = rawSamples.Count - AnalysisWindowSize;
         float mean = 0.0f;
         for (int i = 0; i < AnalysisWindowSize; i++)
-        {
             mean += rawSamples[offset + i];
-        }
-
         mean /= AnalysisWindowSize;
 
         float[] centered = new float[AnalysisWindowSize];
         for (int i = 0; i < AnalysisWindowSize; i++)
-        {
             centered[i] = rawSamples[offset + i] - mean;
-        }
 
-        int minLag = 2;
-        int maxLag = 32;
+        // At 44100 Hz: lag 32 ≈ 1397 Hz (melodica top), lag 252 ≈ 175 Hz (melodica bottom)
+        int minLag = 32;
+        int maxLag = 252;
         float bestScore = float.MinValue;
         int bestLag = -1;
 
@@ -551,9 +470,7 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         {
             float corr = 0.0f;
             for (int i = 0; i < AnalysisWindowSize - lag; i++)
-            {
                 corr += centered[i] * centered[i + lag];
-            }
 
             if (corr > bestScore)
             {
@@ -563,11 +480,15 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         }
 
         if (bestLag <= 0 || bestScore <= 0)
-        {
             return 0.0f;
-        }
 
-        return (float)SampleRateHz / bestLag;
+        float freq = (float)SampleRateHz / bestLag;
+
+        // Silence gate: reject anything outside the melodica range
+        if (freq < MelodicaMinHz || freq > MelodicaMaxHz)
+            return 0.0f;
+
+        return freq;
     }
 
     private static bool TryMapFrequencyToNote(float frequency, out char note, out int barValue)
@@ -575,12 +496,10 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         note = '\0';
         barValue = 64;
 
-        foreach (PitchRange range in GuitarRanges)
+        foreach (PitchRange range in MelodicaRanges)
         {
             if (frequency <= range.Low || frequency >= range.High)
-            {
                 continue;
-            }
 
             note = range.Note;
             float t = Mathf.Clamp((frequency - range.Low) / (range.High - range.Low), 0.0f, 1.0f);
@@ -590,154 +509,92 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
 
         return false;
     }
-    private void SpawnNoteFromSerial(char note, int barValue)
-    {
-        float nowSeconds = Time.GetTicksMsec() / 1000.0f;
-        if (lastSpawnTimeSeconds >= 0 && nowSeconds - lastSpawnTimeSeconds < SpawnCooldownSeconds)
-        {
-            return;
-        }
-
-        notes.Add(
-            new NoteState
-            {
-                X = Width + 30,
-                Y = GetYForNote(note, barValue),
-                Hit = false,
-            }
-        );
-
-        lastSpawnTimeSeconds = nowSeconds;
-    }
 
     private float GetYForNote(char note, int barValue)
     {
         return note switch
         {
-            'e' => 60,
-            'A' => 120,
-            'D' => 180,
-            'G' => 240,
-            'B' => 300,
-            'E' => 360,
+            'L' => 300,  // low register
+            'M' => 200,  // mid register
+            'H' => 100,  // high register
             _ => Mathf.Lerp(Height - 40, 40, Mathf.Clamp(barValue, 0, 128) / 128.0f),
         };
     }
 
-    private static int ComparePortNames(string left, string right)
-    {
-        int leftRank = GetPortRank(left);
-        int rightRank = GetPortRank(right);
-        if (leftRank != rightRank)
-        {
-            return leftRank.CompareTo(rightRank);
-        }
-
-        return string.Compare(left, right, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static int GetPortRank(string name)
-    {
-        if (name.Contains("ttyACM", StringComparison.OrdinalIgnoreCase))
-        {
-            return 0;
-        }
-
-        if (name.Contains("ttyUSB", StringComparison.OrdinalIgnoreCase))
-        {
-            return 1;
-        }
-
-        if (name.Contains("COM", StringComparison.OrdinalIgnoreCase))
-        {
-            return 2;
-        }
-
-        return 3;
-    }
-
     private void SpawnRandomNote()
-{
-    char[] possibleNotes = { 'e', 'A', 'D', 'G', 'B', 'E' };
-    char note = possibleNotes[GD.RandRange(0, possibleNotes.Length - 1)];
-
-    notes.Add(new NoteState
     {
-        X = Width + 30,
-        Y = GetYForNote(note, 64),
-        Hit = false,
-    });
-}
+        char[] possibleNotes = ['L', 'M', 'H'];
+        char note = possibleNotes[GD.RandRange(0, possibleNotes.Length - 1)];
 
-private void ComputeSpectrum()
-{
-    if (rawSamples.Count < AnalysisWindowSize)
-        return;
-
-    int offset = rawSamples.Count - AnalysisWindowSize;
-
-    float mean = 0;
-    for (int i = 0; i < AnalysisWindowSize; i++)
-        mean += rawSamples[offset + i];
-    mean /= AnalysisWindowSize;
-
-    float[] centered = new float[AnalysisWindowSize];
-    for (int i = 0; i < AnalysisWindowSize; i++)
-        centered[i] = rawSamples[offset + i] - mean;
-
-    // reset spectrum
-    for (int i = 0; i < SpectrumSize; i++)
-        spectrum[i] = 0;
-
-    int minLag = 2;
-    int maxLag = 40;
-
-    for (int lag = minLag; lag < maxLag; lag++)
-    {
-        float corr = 0;
-
-        for (int i = 0; i < AnalysisWindowSize - lag; i++)
+        notes.Add(new NoteState
         {
-            corr += centered[i] * centered[i + lag];
-        }
-
-        int index = Mathf.Clamp((int)((float)lag / maxLag * SpectrumSize), 0, SpectrumSize - 1);
-
-        spectrum[index] += Mathf.Max(0, corr);
+            X = Width + 30,
+            Y = GetYForNote(note, 64),
+            Hit = false,
+        });
     }
 
-    // normalize
-    float max = 0;
-    for (int i = 0; i < SpectrumSize; i++)
-        max = Mathf.Max(max, spectrum[i]);
-
-    if (max > 0)
+    private void ComputeSpectrum()
     {
+        if (rawSamples.Count < AnalysisWindowSize)
+            return;
+
+        int offset = rawSamples.Count - AnalysisWindowSize;
+
+        float mean = 0;
+        for (int i = 0; i < AnalysisWindowSize; i++)
+            mean += rawSamples[offset + i];
+        mean /= AnalysisWindowSize;
+
+        float[] centered = new float[AnalysisWindowSize];
+        for (int i = 0; i < AnalysisWindowSize; i++)
+            centered[i] = rawSamples[offset + i] - mean;
+
         for (int i = 0; i < SpectrumSize; i++)
-            spectrum[i] /= max;
-    }
-}
-private void DrawSpectrum()
-{
-    float baseY = Height - 50;
-    float width = Width;
-    float step = width / SpectrumSize;
+            spectrum[i] = 0;
 
-    Stroke(new Color(0.3f, 1f, 0.6f));
+        int minLag = 32;
+        int maxLag = 252;
 
-    Vector2 prev = Vector2.Zero;
-
-    for (int i = 0; i < SpectrumSize; i++)
-    {
-        float x = i * step;
-        float y = baseY - spectrum[i] * 120; // height scale
-
-        if (i > 0)
+        for (int lag = minLag; lag < maxLag; lag++)
         {
-            Line(prev.X, prev.Y, x, y);
+            float corr = 0;
+            for (int i = 0; i < AnalysisWindowSize - lag; i++)
+                corr += centered[i] * centered[i + lag];
+
+            int index = Mathf.Clamp((int)((float)lag / maxLag * SpectrumSize), 0, SpectrumSize - 1);
+            spectrum[index] += Mathf.Max(0, corr);
         }
 
-        prev = new Vector2(x, y);
+        float max = 0;
+        for (int i = 0; i < SpectrumSize; i++)
+            max = Mathf.Max(max, spectrum[i]);
+
+        if (max > 0)
+        {
+            for (int i = 0; i < SpectrumSize; i++)
+                spectrum[i] /= max;
+        }
     }
-}
+
+    private void DrawSpectrum()
+    {
+        float baseY = Height - 50;
+        float width = Width;
+        float step = width / SpectrumSize;
+
+        Stroke(new Color(0.3f, 1f, 0.6f));
+
+        Vector2 prev = Vector2.Zero;
+        for (int i = 0; i < SpectrumSize; i++)
+        {
+            float x = i * step;
+            float y = baseY - spectrum[i] * 120;
+
+            if (i > 0)
+                Line(prev.X, prev.Y, x, y);
+
+            prev = new Vector2(x, y);
+        }
+    }
 }

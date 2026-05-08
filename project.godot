@@ -16,6 +16,10 @@ config/features=PackedStringArray("4.5", "C#", "GL Compatibility")
 boot_splash/image="uid://mjgtamxnaukf"
 config/icon="uid://b6ewaotlbxjra"
 
+[audio]
+
+driver/enable_input=true
+
 [display]
 
 window/size/viewport_width=1280
