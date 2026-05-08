@@ -116,7 +116,6 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
         Fill(new Color(0f, 1f, 0f));
         playerY = GetYForNote(lastDetectedNote, lastBarValue);
         Circle(noteLaneX, playerY, 12);
-
         foreach (NoteState note in notes)
         {
             note.X -= speed;
@@ -144,7 +143,7 @@ private const float RandomSpawnInterval = 1.0f; // adjust difficulty
             HorizontalAlignment.Center,
             -1,
             20,
-            Colors.White
+            Colors.Black
         );
 
         DrawSketchString(
