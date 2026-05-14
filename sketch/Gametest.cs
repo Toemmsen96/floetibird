@@ -14,20 +14,27 @@ public partial class Gametest : GodotP5
     {
         public float X { get; set; }
         public float Y { get; set; }
+        public char Note { get; set; }
         public bool Hit { get; set; }
     }
 
-    // Melodica F3–F6: ~175 Hz – ~1397 Hz, split into three playable registers
+    private struct FreqPeak
+    {
+        public float Freq;
+        public float Magnitude;
+    }
+
+    // 2-octave melodica F3–F5: ~175 Hz – ~699 Hz, split into three playable registers
     private static readonly PitchRange[] MelodicaRanges =
     {
-        new() { Note = 'L', Low = 175,  High = 370  },  // low register  F3–F#4
-        new() { Note = 'M', Low = 370,  High = 740  },  // mid register  G4–F#5
-        new() { Note = 'H', Low = 740,  High = 1397 },  // high register G5–F6
+        new() { Note = 'L', Low = 175, High = 350 },  // low    F3–F4
+        new() { Note = 'M', Low = 350, High = 523 },  // mid    F4–C5
+        new() { Note = 'H', Low = 523, High = 699 },  // high   C5–F5
     };
 
-    // Full melodica range used for the silence gate
+    // Full 2-octave melodica range used for the silence gate
     private const float MelodicaMinHz = 175f;
-    private const float MelodicaMaxHz = 1397f;
+    private const float MelodicaMaxHz = 699f;
 
     private readonly List<NoteState> notes = new();
     private readonly List<int> rawSamples = new();
@@ -61,7 +68,12 @@ public partial class Gametest : GodotP5
     private int lastBarValue = 64;
 
     private const int SpectrumSize = 64;
+    private const float SpectrumDisplayMinHz = 100f;
+    private const float SpectrumDisplayMaxHz = 1400f;
     private readonly float[] spectrum = new float[SpectrumSize];
+    private FreqPeak[] detectedPeaks = [];
+    private readonly float[] windowedBuffer = new float[AnalysisWindowSize];
+    private const int MaxDetectedPeaks = 4;
 
     private float lastRandomSpawnTime = 0f;
     private const float RandomSpawnInterval = 1.0f;
@@ -106,26 +118,28 @@ public partial class Gametest : GodotP5
 
         Background(new Color(30f / 255f, 30f / 255f, 30f / 255f));
 
+        DrawNoteLanes();
+
         Stroke(new Color(0f, 1f, 0f));
+        StrokeWeight(2f);
         Line(noteLaneX, 0, noteLaneX, Height);
+        StrokeWeight(1f);
 
         NoStroke();
-        Fill(new Color(0f, 1f, 0f));
         playerY = GetYForNote(lastDetectedNote, lastBarValue);
+        Fill(NoteColor(lastDetectedNote));
         Circle(noteLaneX, playerY, 12);
 
         foreach (NoteState note in notes)
         {
             note.X -= speed;
 
-            Fill(new Color(1f, 200f / 255f, 0f));
+            Fill(NoteColor(note.Note));
             Circle(note.X, note.Y, 10);
 
-            float pY = GetYForNote(lastDetectedNote, lastBarValue);
-
             if (!note.Hit &&
-                Mathf.Abs(note.X - noteLaneX) < 10 &&
-                Mathf.Abs(note.Y - pY) < 20)
+                Mathf.Abs(note.X - noteLaneX) < 12 &&
+                note.Note == lastDetectedNote)
             {
                 note.Hit = true;
                 score += 10;
@@ -136,7 +150,7 @@ public partial class Gametest : GodotP5
 
         TextAlign(HorizontalAlignment.Center);
         TextSize(20);
-        Fill(Colors.Black);
+        Fill(Colors.White);
         Text($"Score: {score}", Width * 0.5f, 30);
 
         TextSize(14);
@@ -372,6 +386,40 @@ public partial class Gametest : GodotP5
     private Rect2 GetRecordButtonRect() => new(new Vector2(Width - 200, 10), new Vector2(90, 28));
     private Rect2 GetPlayButtonRect() => new(new Vector2(Width - 100, 10), new Vector2(90, 28));
 
+    private static Color NoteColor(char note) => note switch
+    {
+        'H' => new Color(0.4f, 0.6f, 1.0f),   // blue
+        'M' => new Color(0.3f, 1.0f, 0.5f),   // green
+        'L' => new Color(1.0f, 0.6f, 0.2f),   // orange
+        _   => Colors.White,
+    };
+
+    private void DrawNoteLanes()
+    {
+        StrokeWeight(1f);
+
+        // horizontal lane guide lines
+        float[] laneYs = [100, 200, 300];
+        char[] laneNotes = ['H', 'M', 'L'];
+
+        for (int i = 0; i < laneYs.Length; i++)
+        {
+            Color c = NoteColor(laneNotes[i]);
+            Stroke(new Color(c.R, c.G, c.B, 0.35f));
+            Line(0, laneYs[i], Width, laneYs[i]);
+        }
+
+        // labels on the left
+        TextAlign(HorizontalAlignment.Left);
+        TextSize(13);
+        NoStroke();
+        for (int i = 0; i < laneYs.Length; i++)
+        {
+            Fill(NoteColor(laneNotes[i]));
+            Text(laneNotes[i].ToString(), 6, laneYs[i] - 3);
+        }
+    }
+
     // ── Signal analysis ───────────────────────────────────────────────────────
 
     private void AnalyzeSignalAndSpawnNote()
@@ -389,7 +437,7 @@ public partial class Gametest : GodotP5
 
         if (frequency <= 0)
         {
-            analysisText = "No stable pitch";
+            analysisText = $"No stable pitch | peaks={detectedPeaks.Length}";
             return;
         }
 
@@ -397,55 +445,65 @@ public partial class Gametest : GodotP5
         {
             lastDetectedNote = note;
             lastBarValue = barValue;
-            analysisText = $"f={frequency:0.0}Hz note={note} bar={barValue}";
+            string topPeak = detectedPeaks.Length > 0 ? $" top={detectedPeaks[0].Freq:0}Hz" : "";
+            analysisText = $"f={frequency:0.0}Hz note={note}{topPeak} peaks={detectedPeaks.Length}";
         }
         else
         {
-            analysisText = $"f={frequency:0.0}Hz (out of range)";
+            analysisText = $"f={frequency:0.0}Hz (out of range) peaks={detectedPeaks.Length}";
         }
     }
 
     private float EstimateFrequencyFromLatestSamples()
     {
+        if (rawSamples.Count < AnalysisWindowSize) return 0f;
+
         int offset = rawSamples.Count - AnalysisWindowSize;
-        float mean = 0.0f;
-        for (int i = 0; i < AnalysisWindowSize; i++)
-            mean += rawSamples[offset + i];
+        float mean = 0f;
+        for (int i = 0; i < AnalysisWindowSize; i++) mean += rawSamples[offset + i];
         mean /= AnalysisWindowSize;
 
-        float[] centered = new float[AnalysisWindowSize];
+        float rms = 0f;
         for (int i = 0; i < AnalysisWindowSize; i++)
-            centered[i] = rawSamples[offset + i] - mean;
-
-        // At 44100 Hz: lag 32 ≈ 1397 Hz (melodica top), lag 252 ≈ 175 Hz (melodica bottom)
-        int minLag = 32;
-        int maxLag = 252;
-        float bestScore = float.MinValue;
-        int bestLag = -1;
-
-        for (int lag = minLag; lag <= maxLag; lag++)
         {
-            float corr = 0.0f;
-            for (int i = 0; i < AnalysisWindowSize - lag; i++)
-                corr += centered[i] * centered[i + lag];
+            float s = rawSamples[offset + i] - mean;
+            rms += s * s;
+        }
+        rms = Mathf.Sqrt(rms / AnalysisWindowSize);
 
-            if (corr > bestScore)
+        if (rms < 160f) return 0f;
+        if (detectedPeaks.Length == 0) return 0f;
+
+        float bestScore = 0f;
+        float bestFreq = 0f;
+
+        foreach (FreqPeak peak in detectedPeaks)
+        {
+            if (peak.Freq < MelodicaMinHz || peak.Freq > MelodicaMaxHz) continue;
+
+            // Reward harmonics at 2f and 3f being present in the spectrum
+            float score = peak.Magnitude;
+            score += SampleSpectrumAtFreq(peak.Freq * 2f) * 0.5f;
+            score += SampleSpectrumAtFreq(peak.Freq * 3f) * 0.3f;
+            // Penalize if a strong sub-harmonic exists (suggests this peak is itself a harmonic)
+            score *= 1f - SampleSpectrumAtFreq(peak.Freq * 0.5f) * 0.7f;
+
+            if (score > bestScore)
             {
-                bestScore = corr;
-                bestLag = lag;
+                bestScore = score;
+                bestFreq = peak.Freq;
             }
         }
 
-        if (bestLag <= 0 || bestScore <= 0)
-            return 0.0f;
+        return bestFreq;
+    }
 
-        float freq = (float)SampleRateHz / bestLag;
-
-        // Silence gate: reject anything outside the melodica range
-        if (freq < MelodicaMinHz || freq > MelodicaMaxHz)
-            return 0.0f;
-
-        return freq;
+    private float SampleSpectrumAtFreq(float freq)
+    {
+        float binF = (freq - SpectrumDisplayMinHz) * (SpectrumSize - 1) / (SpectrumDisplayMaxHz - SpectrumDisplayMinHz);
+        if (binF < 0 || binF >= SpectrumSize - 1) return 0f;
+        int b = (int)binF;
+        return Mathf.Lerp(spectrum[b], spectrum[b + 1], binF - b);
     }
 
     private static bool TryMapFrequencyToNote(float frequency, out char note, out int barValue)
@@ -487,6 +545,7 @@ public partial class Gametest : GodotP5
         {
             X = Width + 30,
             Y = GetYForNote(note, 64),
+            Note = note,
             Hit = false,
         });
     }
@@ -494,64 +553,138 @@ public partial class Gametest : GodotP5
     private void ComputeSpectrum()
     {
         if (rawSamples.Count < AnalysisWindowSize)
+        {
+            detectedPeaks = [];
             return;
+        }
 
         int offset = rawSamples.Count - AnalysisWindowSize;
 
         float mean = 0;
-        for (int i = 0; i < AnalysisWindowSize; i++)
-            mean += rawSamples[offset + i];
+        for (int i = 0; i < AnalysisWindowSize; i++) mean += rawSamples[offset + i];
         mean /= AnalysisWindowSize;
 
-        float[] centered = new float[AnalysisWindowSize];
         for (int i = 0; i < AnalysisWindowSize; i++)
-            centered[i] = rawSamples[offset + i] - mean;
-
-        for (int i = 0; i < SpectrumSize; i++)
-            spectrum[i] = 0;
-
-        int minLag = 32;
-        int maxLag = 252;
-
-        for (int lag = minLag; lag < maxLag; lag++)
         {
-            float corr = 0;
-            for (int i = 0; i < AnalysisWindowSize - lag; i++)
-                corr += centered[i] * centered[i + lag];
-
-            int index = Mathf.Clamp((int)((float)lag / maxLag * SpectrumSize), 0, SpectrumSize - 1);
-            spectrum[index] += Mathf.Max(0, corr);
+            float hann = 0.5f * (1f - Mathf.Cos(2f * Mathf.Pi * i / (AnalysisWindowSize - 1)));
+            windowedBuffer[i] = (rawSamples[offset + i] - mean) * hann;
         }
 
+        float freqSpan = SpectrumDisplayMaxHz - SpectrumDisplayMinHz;
         float max = 0;
-        for (int i = 0; i < SpectrumSize; i++)
-            max = Mathf.Max(max, spectrum[i]);
+        for (int k = 0; k < SpectrumSize; k++)
+        {
+            float freq = SpectrumDisplayMinHz + k * freqSpan / (SpectrumSize - 1);
+            spectrum[k] = GoertzelMagnitude(windowedBuffer, freq, SampleRateHz);
+            if (spectrum[k] > max) max = spectrum[k];
+        }
 
         if (max > 0)
+            for (int i = 0; i < SpectrumSize; i++) spectrum[i] /= max;
+        else
+            System.Array.Clear(spectrum, 0, SpectrumSize);
+
+        detectedPeaks = FindSpectrumPeaks();
+    }
+
+    private static float GoertzelMagnitude(float[] samples, float targetFreq, float sampleRate)
+    {
+        float omega = 2f * Mathf.Pi * targetFreq / sampleRate;
+        float coeff = 2f * Mathf.Cos(omega);
+        float s1 = 0f, s2 = 0f;
+        foreach (float x in samples)
         {
-            for (int i = 0; i < SpectrumSize; i++)
-                spectrum[i] /= max;
+            float s0 = x + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
         }
+        return Mathf.Sqrt(s1 * s1 + s2 * s2 - s1 * s2 * coeff);
+    }
+
+    private FreqPeak[] FindSpectrumPeaks()
+    {
+        var candidates = new System.Collections.Generic.List<FreqPeak>(8);
+        for (int i = 1; i < SpectrumSize - 1; i++)
+        {
+            if (spectrum[i] > spectrum[i - 1] && spectrum[i] > spectrum[i + 1] && spectrum[i] >= 0.1f)
+            {
+                float freq = SpectrumDisplayMinHz + i * (SpectrumDisplayMaxHz - SpectrumDisplayMinHz) / (SpectrumSize - 1);
+                candidates.Add(new FreqPeak { Freq = freq, Magnitude = spectrum[i] });
+            }
+        }
+        candidates.Sort((a, b) => b.Magnitude.CompareTo(a.Magnitude));
+        int count = Mathf.Min(candidates.Count, MaxDetectedPeaks);
+        FreqPeak[] result = new FreqPeak[count];
+        for (int i = 0; i < count; i++) result[i] = candidates[i];
+        return result;
     }
 
     private void DrawSpectrum()
     {
         float baseY = Height - 50;
-        float width = Width;
-        float step = width / SpectrumSize;
+        float maxBarH = 110f;
+        float barWidth = (float)Width / SpectrumSize;
 
-        Stroke(new Color(0.3f, 1f, 0.6f));
+        // Highlight melodica fundamental range
+        float melStartX = (MelodicaMinHz - SpectrumDisplayMinHz) / (SpectrumDisplayMaxHz - SpectrumDisplayMinHz) * Width;
+        float melEndX   = (MelodicaMaxHz - SpectrumDisplayMinHz) / (SpectrumDisplayMaxHz - SpectrumDisplayMinHz) * Width;
+        DrawRect(new Rect2(melStartX, baseY - maxBarH, melEndX - melStartX, maxBarH), new Color(0.15f, 0.3f, 0.15f), true);
 
+        // Spectrum bars
+        NoStroke();
+        for (int i = 0; i < SpectrumSize; i++)
+        {
+            float h = spectrum[i] * maxBarH;
+            if (h < 1f) continue;
+            float freq = SpectrumDisplayMinHz + i * (SpectrumDisplayMaxHz - SpectrumDisplayMinHz) / (SpectrumSize - 1);
+            bool inRange = freq >= MelodicaMinHz && freq <= MelodicaMaxHz;
+            DrawRect(new Rect2(i * barWidth + 1, baseY - h, barWidth - 2, h),
+                     inRange ? new Color(0.2f, 0.75f, 0.45f) : new Color(0.25f, 0.4f, 0.55f), true);
+        }
+
+        // Spectrum outline
+        Stroke(new Color(0.3f, 1f, 0.65f));
+        StrokeWeight(1f);
         Vector2 prev = Vector2.Zero;
         for (int i = 0; i < SpectrumSize; i++)
         {
-            float x = i * step;
-            float y = baseY - spectrum[i] * 120;
-
-            if (i > 0)
-                Line(prev.X, prev.Y, x, y);
-
+            float x = i * barWidth + barWidth * 0.5f;
+            float y = baseY - spectrum[i] * maxBarH;
+            if (i > 0) Line(prev.X, prev.Y, x, y);
             prev = new Vector2(x, y);
+        }
+
+        // Detected peak markers with Hz labels
+        for (int p = 0; p < detectedPeaks.Length; p++)
+        {
+            FreqPeak peak = detectedPeaks[p];
+            float px = (peak.Freq - SpectrumDisplayMinHz) / (SpectrumDisplayMaxHz - SpectrumDisplayMinHz) * Width;
+            float py = baseY - peak.Magnitude * maxBarH;
+            bool inRange = peak.Freq >= MelodicaMinHz && peak.Freq <= MelodicaMaxHz;
+            Color peakCol = inRange ? new Color(1f, 0.9f, 0.1f) : new Color(1f, 0.5f, 0.2f);
+
+            Stroke(peakCol);
+            StrokeWeight(1f);
+            Line(px, py, px, baseY);
+            NoStroke();
+            Fill(peakCol);
+            Circle(px, py, 4);
+
+            TextAlign(HorizontalAlignment.Center);
+            TextSize(9);
+            Fill(Colors.White);
+            Text($"{peak.Freq:0}Hz", px, py - 8);
+        }
+
+        // Frequency axis labels
+        NoStroke();
+        Fill(new Color(0.55f, 0.55f, 0.55f));
+        TextSize(9);
+        TextAlign(HorizontalAlignment.Center);
+        foreach (float lf in new float[] { 200f, 400f, 600f, 800f, 1000f, 1200f })
+        {
+            float lx = (lf - SpectrumDisplayMinHz) / (SpectrumDisplayMaxHz - SpectrumDisplayMinHz) * Width;
+            Text($"{(int)lf}", lx, baseY + 12);
         }
     }
 }
