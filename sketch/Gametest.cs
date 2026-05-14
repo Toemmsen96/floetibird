@@ -54,7 +54,6 @@ public partial class Gametest : GodotP5
     private bool isPlayingBack;
     private int playbackIndex;
     private float playbackSampleAccumulator;
-    private bool wasLeftMouseDown;
     private AudioStreamPlayer playbackAudioPlayer;
     private const int PlaybackMixRateHz = 44100;
     private float playerY = 200;
@@ -83,12 +82,9 @@ public partial class Gametest : GodotP5
         isPlayingBack = false;
         playbackIndex = 0;
         playbackSampleAccumulator = 0.0f;
-        wasLeftMouseDown = false;
-
         SetTitle("Gametest");
         SetViewportMode(ViewportMode.Always);
         CreateCanvas(800, 400);
-        GD.Randomize();
         Background(new Color(30f / 255f, 30f / 255f, 30f / 255f));
 
         StartMicCapture();
@@ -96,7 +92,6 @@ public partial class Gametest : GodotP5
 
     public override void DrawSketch()
     {
-        HandleButtonClicks();
         PollMicrophone();
         ComputeSpectrum();
         PumpPlaybackSamples();
@@ -139,35 +134,17 @@ public partial class Gametest : GodotP5
 
         notes.RemoveAll(note => note.X <= -50);
 
-        DrawSketchString(
-            ThemeDB.FallbackFont,
-            new Vector2(Width * 0.5f, 30),
-            $"Score: {score}",
-            HorizontalAlignment.Center,
-            -1,
-            20,
-            Colors.Black
-        );
+        TextAlign(HorizontalAlignment.Center);
+        TextSize(20);
+        Fill(Colors.Black);
+        Text($"Score: {score}", Width * 0.5f, 30);
 
-        DrawSketchString(
-            ThemeDB.FallbackFont,
-            new Vector2(Width * 0.5f, Height - 40),
-            "Listening via computer microphone",
-            HorizontalAlignment.Center,
-            -1,
-            14,
-            Colors.White
-        );
+        TextSize(14);
+        Fill(Colors.White);
+        Text("Listening via computer microphone", Width * 0.5f, Height - 40);
 
-        DrawSketchString(
-            ThemeDB.FallbackFont,
-            new Vector2(Width * 0.5f, Height - 20),
-            $"{micStatusText} | {analysisText} | rec={isRecording} play={isPlayingBack} samples={recordedSamples.Count}",
-            HorizontalAlignment.Center,
-            -1,
-            12,
-            Colors.White
-        );
+        TextSize(12);
+        Text($"{micStatusText} | {analysisText} | rec={isRecording} play={isPlayingBack} samples={recordedSamples.Count}", Width * 0.5f, Height - 20);
 
         DrawButtons();
         DrawSpectrum();
@@ -376,40 +353,20 @@ public partial class Gametest : GodotP5
         DrawRect(recordButtonRect, Colors.White, false, 1.0f);
         DrawRect(playButtonRect, Colors.White, false, 1.0f);
 
-        DrawSketchString(
-            ThemeDB.FallbackFont,
-            new Vector2(recordButtonRect.Position.X + recordButtonRect.Size.X * 0.5f, recordButtonRect.Position.Y + 20),
-            isRecording ? "STOP" : "RECORD",
-            HorizontalAlignment.Center,
-            -1,
-            12,
-            Colors.White
-        );
-
-        DrawSketchString(
-            ThemeDB.FallbackFont,
-            new Vector2(playButtonRect.Position.X + playButtonRect.Size.X * 0.5f, playButtonRect.Position.Y + 20),
-            "PLAY",
-            HorizontalAlignment.Center,
-            -1,
-            12,
-            Colors.White
-        );
+        TextAlign(HorizontalAlignment.Center);
+        TextSize(12);
+        Fill(Colors.White);
+        Text(isRecording ? "STOP" : "RECORD", recordButtonRect.Position.X + recordButtonRect.Size.X * 0.5f, recordButtonRect.Position.Y + 20);
+        Text("PLAY", playButtonRect.Position.X + playButtonRect.Size.X * 0.5f, playButtonRect.Position.Y + 20);
     }
 
-    private void HandleButtonClicks()
+    public override void MouseClicked()
     {
-        bool isLeftMouseDown = Input.IsMouseButtonPressed(Godot.MouseButton.Left);
-        if (isLeftMouseDown && !wasLeftMouseDown)
-        {
-            Vector2 clickPos = new Vector2(MouseX, MouseY);
-            if (GetRecordButtonRect().HasPoint(clickPos))
-                ToggleRecording();
-            else if (GetPlayButtonRect().HasPoint(clickPos))
-                StartPlayback();
-        }
-
-        wasLeftMouseDown = isLeftMouseDown;
+        Vector2 clickPos = new(MouseX, MouseY);
+        if (GetRecordButtonRect().HasPoint(clickPos))
+            ToggleRecording();
+        else if (GetPlayButtonRect().HasPoint(clickPos))
+            StartPlayback();
     }
 
     private Rect2 GetRecordButtonRect() => new(new Vector2(Width - 200, 10), new Vector2(90, 28));
@@ -524,7 +481,7 @@ public partial class Gametest : GodotP5
     private void SpawnRandomNote()
     {
         char[] possibleNotes = ['L', 'M', 'H'];
-        char note = possibleNotes[GD.RandRange(0, possibleNotes.Length - 1)];
+        char note = possibleNotes[Random(0, possibleNotes.Length)];
 
         notes.Add(new NoteState
         {
