@@ -24,17 +24,20 @@ public partial class Gametest : GodotP5
         public float Magnitude;
     }
 
-    // 2-octave melodica F3–F5: ~175 Hz – ~699 Hz, split into three playable registers
+    // Melodica E3–Eb5: ~162 Hz – ~637 Hz, split into three playable registers
     private static readonly PitchRange[] MelodicaRanges =
     {
-        new() { Note = 'L', Low = 175, High = 350 },  // low    F3–F4
+        new() { Note = 'L', Low = 160, High = 350 },  // low    E3–F4
         new() { Note = 'M', Low = 350, High = 523 },  // mid    F4–C5
-        new() { Note = 'H', Low = 523, High = 699 },  // high   C5–F5
+        new() { Note = 'H', Low = 523, High = 637 },  // high   C5–Eb5
     };
 
-    // Full 2-octave melodica range used for the silence gate
-    private const float MelodicaMinHz = 175f;
-    private const float MelodicaMaxHz = 699f;
+    // Full melodica range
+    private const float MelodicaMinHz = 160f;
+    private const float MelodicaMaxHz = 637f;
+
+    // Silence gate: RMS below this value (out of 32767) is treated as no signal
+    private const float SilenceGateRms = 500f;
 
     private readonly List<NoteState> notes = new();
     private readonly List<int> rawSamples = new();
@@ -74,6 +77,8 @@ public partial class Gametest : GodotP5
     private FreqPeak[] detectedPeaks = [];
     private readonly float[] windowedBuffer = new float[AnalysisWindowSize];
     private const int MaxDetectedPeaks = 4;
+    private float lastRms = 0f;
+    private const float RmsDisplayMax = 8000f;
 
     private float lastRandomSpawnTime = 0f;
     private const float RandomSpawnInterval = 1.0f;
@@ -471,7 +476,8 @@ public partial class Gametest : GodotP5
         }
         rms = Mathf.Sqrt(rms / AnalysisWindowSize);
 
-        if (rms < 160f) return 0f;
+        lastRms = rms;
+        if (rms < SilenceGateRms) return 0f;
         if (detectedPeaks.Length == 0) return 0f;
 
         float bestScore = 0f;
@@ -686,5 +692,28 @@ public partial class Gametest : GodotP5
             float lx = (lf - SpectrumDisplayMinHz) / (SpectrumDisplayMaxHz - SpectrumDisplayMinHz) * Width;
             Text($"{(int)lf}", lx, baseY + 12);
         }
+
+        // VU meter — thin vertical bar on the right edge
+        const float vuW = 10f;
+        float vuX = Width - vuW - 2;
+        float rmsNorm = Mathf.Min(lastRms / RmsDisplayMax, 1f);
+        float threshNorm = Mathf.Min(SilenceGateRms / RmsDisplayMax, 1f);
+        // background track
+        DrawRect(new Rect2(vuX, baseY - maxBarH, vuW, maxBarH), new Color(0.15f, 0.15f, 0.15f), true);
+        // level bar: red below threshold, green above
+        bool active = lastRms >= SilenceGateRms;
+        float barH = rmsNorm * maxBarH;
+        DrawRect(new Rect2(vuX, baseY - barH, vuW, barH),
+                 active ? new Color(0.2f, 0.9f, 0.3f) : new Color(0.7f, 0.2f, 0.2f), true);
+        // threshold line
+        float threshY = baseY - threshNorm * maxBarH;
+        Stroke(new Color(1f, 0.85f, 0f));
+        StrokeWeight(1f);
+        Line(vuX - 2, threshY, vuX + vuW + 2, threshY);
+        NoStroke();
+        Fill(new Color(0.55f, 0.55f, 0.55f));
+        TextSize(8);
+        TextAlign(HorizontalAlignment.Right);
+        Text("VOL", vuX - 3, baseY - maxBarH + 8);
     }
 }
