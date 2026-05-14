@@ -3,18 +3,11 @@ using System.Collections.Generic;
 
 public partial class Gametest : GodotP5
 {
-    private sealed class PitchRange
-    {
-        public char Note { get; set; }
-        public float Low { get; set; }
-        public float High { get; set; }
-    }
-
     private sealed class NoteState
     {
         public float X { get; set; }
         public float Y { get; set; }
-        public char Note { get; set; }
+        public int MidiNote { get; set; }
         public bool Hit { get; set; }
     }
 
@@ -24,20 +17,30 @@ public partial class Gametest : GodotP5
         public float Magnitude;
     }
 
-    // Melodica E3–Eb5: ~162 Hz – ~637 Hz, split into three playable registers
-    private static readonly PitchRange[] MelodicaRanges =
-    {
-        new() { Note = 'L', Low = 160, High = 350 },  // low    E3–F4
-        new() { Note = 'M', Low = 350, High = 523 },  // mid    F4–C5
-        new() { Note = 'H', Low = 523, High = 637 },  // high   C5–Eb5
-    };
-
-    // Full melodica range
+    // Melodica MIDI range: E3 (52) – D#5 (75), approximately 160–637 Hz
     private const float MelodicaMinHz = 160f;
     private const float MelodicaMaxHz = 637f;
+    private const int MidiNoteMin = 52;   // E3
+    private const int MidiNoteMax = 75;   // D#5
+
+    private static readonly string[] ChromaticNames =
+        { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+
+    private static bool IsNaturalNote(int midi) =>
+        (midi % 12) is 0 or 2 or 4 or 5 or 7 or 9 or 11;
+
+    private static string MidiToNoteName(int midi) =>
+        ChromaticNames[midi % 12] + (midi / 12 - 1);
+
+    private static float MidiToFreq(int midi) =>
+        440f * Mathf.Pow(2f, (midi - 69) / 12f);
 
     // Silence gate: RMS below this value (out of 32767) is treated as no signal
     private const float SilenceGateRms = 500f;
+
+    // Game lane bounds (Y coords, top = highest pitch)
+    private const float LaneTopY = 45f;
+    private const float LaneBottomY = 510f;
 
     private readonly List<NoteState> notes = new();
     private readonly List<int> rawSamples = new();
@@ -67,8 +70,7 @@ public partial class Gametest : GodotP5
     private AudioStreamPlayer playbackAudioPlayer;
     private const int PlaybackMixRateHz = 44100;
     private float playerY = 200;
-    private char lastDetectedNote = 'M';
-    private int lastBarValue = 64;
+    private int lastDetectedMidiNote = 64;  // E4
 
     private const int SpectrumSize = 64;
     private const float SpectrumDisplayMinHz = 100f;
@@ -101,7 +103,7 @@ public partial class Gametest : GodotP5
         playbackSampleAccumulator = 0.0f;
         SetTitle("Gametest");
         SetViewportMode(ViewportMode.Always);
-        CreateCanvas(800, 400);
+        CreateCanvas(1200, 700);
         Background(new Color(30f / 255f, 30f / 255f, 30f / 255f));
 
         StartMicCapture();
@@ -127,24 +129,24 @@ public partial class Gametest : GodotP5
 
         Stroke(new Color(0f, 1f, 0f));
         StrokeWeight(2f);
-        Line(noteLaneX, 0, noteLaneX, Height);
+        Line(noteLaneX, LaneTopY, noteLaneX, LaneBottomY);
         StrokeWeight(1f);
 
         NoStroke();
-        playerY = GetYForNote(lastDetectedNote, lastBarValue);
-        Fill(NoteColor(lastDetectedNote));
-        Circle(noteLaneX, playerY, 12);
+        playerY = GetYForNote(lastDetectedMidiNote);
+        Fill(NoteColor(lastDetectedMidiNote));
+        Circle(noteLaneX, playerY, 7);
 
         foreach (NoteState note in notes)
         {
             note.X -= speed;
 
-            Fill(NoteColor(note.Note));
-            Circle(note.X, note.Y, 10);
+            Fill(NoteColor(note.MidiNote));
+            Circle(note.X, note.Y, 6);
 
             if (!note.Hit &&
                 Mathf.Abs(note.X - noteLaneX) < 12 &&
-                note.Note == lastDetectedNote)
+                note.MidiNote == lastDetectedMidiNote)
             {
                 note.Hit = true;
                 score += 10;
@@ -391,38 +393,40 @@ public partial class Gametest : GodotP5
     private Rect2 GetRecordButtonRect() => new(new Vector2(Width - 200, 10), new Vector2(90, 28));
     private Rect2 GetPlayButtonRect() => new(new Vector2(Width - 100, 10), new Vector2(90, 28));
 
-    private static Color NoteColor(char note) => note switch
-    {
-        'H' => new Color(0.4f, 0.6f, 1.0f),   // blue
-        'M' => new Color(0.3f, 1.0f, 0.5f),   // green
-        'L' => new Color(1.0f, 0.6f, 0.2f),   // orange
-        _   => Colors.White,
-    };
+    private static Color NoteColor(int midiNote) =>
+        Color.FromHsv((midiNote % 12) / 12f, 0.75f, 0.95f);
 
     private void DrawNoteLanes()
     {
-        StrokeWeight(1f);
+        float noteH = (LaneBottomY - LaneTopY) / (MidiNoteMax - MidiNoteMin + 1);
 
-        // horizontal lane guide lines
-        float[] laneYs = [100, 200, 300];
-        char[] laneNotes = ['H', 'M', 'L'];
-
-        for (int i = 0; i < laneYs.Length; i++)
+        for (int midi = MidiNoteMin; midi <= MidiNoteMax; midi++)
         {
-            Color c = NoteColor(laneNotes[i]);
-            Stroke(new Color(c.R, c.G, c.B, 0.35f));
-            Line(0, laneYs[i], Width, laneYs[i]);
-        }
+            float cy = GetYForNote(midi);
+            bool natural = IsNaturalNote(midi);
+            bool isC     = (midi % 12) == 0;
 
-        // labels on the left
-        TextAlign(HorizontalAlignment.Left);
-        TextSize(13);
+            // background band
+            Color bg = natural ? new Color(0.16f, 0.16f, 0.16f) : new Color(0.10f, 0.10f, 0.10f);
+            DrawRect(new Rect2(0, cy - noteH * 0.5f, Width, noteH - 1f), bg, true);
+
+            // separator line at bottom of band
+            Stroke(isC ? new Color(0.50f, 0.50f, 0.80f, 0.8f) : new Color(0.28f, 0.28f, 0.28f, 0.6f));
+            StrokeWeight(isC ? 1.5f : 0.5f);
+            Line(0, cy + noteH * 0.5f, Width, cy + noteH * 0.5f);
+
+            // note label on the left
+            if (natural)
+            {
+                NoStroke();
+                Color col = isC ? new Color(0.75f, 0.75f, 1.00f) : new Color(0.50f, 0.50f, 0.50f);
+                Fill(col);
+                TextAlign(HorizontalAlignment.Left);
+                TextSize(isC ? 11 : 9);
+                Text(MidiToNoteName(midi), 4, cy + 4);
+            }
+        }
         NoStroke();
-        for (int i = 0; i < laneYs.Length; i++)
-        {
-            Fill(NoteColor(laneNotes[i]));
-            Text(laneNotes[i].ToString(), 6, laneYs[i] - 3);
-        }
     }
 
     // ── Signal analysis ───────────────────────────────────────────────────────
@@ -446,12 +450,11 @@ public partial class Gametest : GodotP5
             return;
         }
 
-        if (TryMapFrequencyToNote(frequency, out char note, out int barValue))
+        if (TryMapFrequencyToNote(frequency, out int midiNote))
         {
-            lastDetectedNote = note;
-            lastBarValue = barValue;
+            lastDetectedMidiNote = midiNote;
             string topPeak = detectedPeaks.Length > 0 ? $" top={detectedPeaks[0].Freq:0}Hz" : "";
-            analysisText = $"f={frequency:0.0}Hz note={note}{topPeak} peaks={detectedPeaks.Length}";
+            analysisText = $"f={frequency:0.0}Hz {MidiToNoteName(midiNote)}{topPeak} peaks={detectedPeaks.Length}";
         }
         else
         {
@@ -512,46 +515,32 @@ public partial class Gametest : GodotP5
         return Mathf.Lerp(spectrum[b], spectrum[b + 1], binF - b);
     }
 
-    private static bool TryMapFrequencyToNote(float frequency, out char note, out int barValue)
+    private static bool TryMapFrequencyToNote(float frequency, out int midiNote)
     {
-        note = '\0';
-        barValue = 64;
-
-        foreach (PitchRange range in MelodicaRanges)
+        if (frequency < MelodicaMinHz || frequency > MelodicaMaxHz)
         {
-            if (frequency <= range.Low || frequency >= range.High)
-                continue;
-
-            note = range.Note;
-            float t = Mathf.Clamp((frequency - range.Low) / (range.High - range.Low), 0.0f, 1.0f);
-            barValue = Mathf.RoundToInt(Mathf.Lerp(1, 128, t));
-            return true;
+            midiNote = 0;
+            return false;
         }
-
-        return false;
+        float midi = 69f + 12f * (Mathf.Log(frequency / 440f) / Mathf.Log(2f));
+        midiNote = Mathf.Clamp(Mathf.RoundToInt(midi), MidiNoteMin, MidiNoteMax);
+        return true;
     }
 
-    private float GetYForNote(char note, int barValue)
+    private static float GetYForNote(int midiNote)
     {
-        return note switch
-        {
-            'L' => 300,  // low register
-            'M' => 200,  // mid register
-            'H' => 100,  // high register
-            _ => Mathf.Lerp(Height - 40, 40, Mathf.Clamp(barValue, 0, 128) / 128.0f),
-        };
+        float t = (float)(midiNote - MidiNoteMin) / (MidiNoteMax - MidiNoteMin);
+        return Mathf.Lerp(LaneBottomY, LaneTopY, t);
     }
 
     private void SpawnRandomNote()
     {
-        char[] possibleNotes = ['L', 'M', 'H'];
-        char note = possibleNotes[Random(0, possibleNotes.Length)];
-
+        int midi = Random(MidiNoteMin, MidiNoteMax + 1);
         notes.Add(new NoteState
         {
             X = Width + 30,
-            Y = GetYForNote(note, 64),
-            Note = note,
+            Y = GetYForNote(midi),
+            MidiNote = midi,
             Hit = false,
         });
     }
@@ -627,8 +616,8 @@ public partial class Gametest : GodotP5
 
     private void DrawSpectrum()
     {
-        float baseY = Height - 50;
-        float maxBarH = 110f;
+        const float baseY = 575f;   // sits just below LaneBottomY (510)
+        const float maxBarH = 55f;
         float barWidth = (float)Width / SpectrumSize;
 
         // Highlight melodica fundamental range
